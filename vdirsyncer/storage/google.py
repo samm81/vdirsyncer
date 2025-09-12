@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 TOKEN_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-REFRESH_URL = "https://www.googleapis.com/oauth2/v4/token"
+REFRESH_URL = "https://oauth2.googleapis.com/token"
 
 try:
     from aiohttp_oauthlib import OAuth2Session
@@ -70,8 +70,10 @@ class GoogleSession(dav.DAVSession):
 
         return await super().request(method, path, **kwargs)
 
-    async def _save_token(self, token):
+    def _save_token(self, token):
         """Helper function called by OAuth2Session when a token is updated."""
+        # Update in-memory token immediately so subsequent sessions use it.
+        self._token = token
         checkdir(expand_path(os.path.dirname(self._token_file)), create=True)
         with atomic_write(self._token_file, mode="w", overwrite=True) as f:
             json.dump(token, f)
@@ -132,10 +134,10 @@ class GoogleSession(dav.DAVSession):
 
                 authorization_url, state = session.authorization_url(
                     TOKEN_URL,
-                    # access_type and approval_prompt are Google specific
+                    # access_type and prompt are Google specific
                     # extra parameters.
                     access_type="offline",
-                    approval_prompt="force",
+                    prompt="consent",
                 )
                 click.echo(f"Opening {authorization_url} ...")
                 try:
@@ -163,7 +165,7 @@ class GoogleSession(dav.DAVSession):
                 local_server.server_close()
 
             # FIXME: Ugly
-            await self._save_token(self._token)
+            self._save_token(self._token)
 
 
 class GoogleCalendarStorage(dav.CalDAVStorage):
