@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import urllib.parse as urlparse
+import asyncio
 import wsgiref.simple_server
-import wsgiref.util
 from pathlib import Path
+from threading import Thread
+from urllib import parse as urlparse
 from threading import Thread
 
 import aiohttp
@@ -105,21 +106,46 @@ class GoogleSession(dav.DAVSession):
         )
 
     async def _init_token(self):
+        # A simple, process-local lock per token file path to avoid
+        # kicking off multiple OAuth flows concurrently when multiple
+        # GoogleSession instances are created at the same time.
+        global _TOKEN_INIT_LOCKS
         try:
-            with self._token_file.open() as f:
-                self._token = json.load(f)
-        except FileNotFoundError:
-            pass
-        except ValueError as e:
-            raise exceptions.UserError(
-                f"Failed to load token file {self._token_file}, try deleting it. "
-                f"Original error: {e}"
-            )
+            _TOKEN_INIT_LOCKS
+        except NameError:
+            _TOKEN_INIT_LOCKS = {}
 
-        if not self._token:
-            # Some times a task stops at this `async`, and another continues the flow.
-            # At this point, the user has already completed the flow, but is prompeted
-            # for a second one.
+        def _load_token_from_file():
+            try:
+                with self._token_file.open() as f:
+                    return json.load(f)
+            except FileNotFoundError:
+                return None
+            except ValueError as e:
+                raise exceptions.UserError(
+                    f"Failed to load token file {self._token_file}, try deleting it. "
+                    f"Original error: {e}"
+                )
+
+        # Fast path: try to load an existing token without taking the lock.
+        self._token = _load_token_from_file()
+        if self._token:
+            return
+
+        # Acquire a per-token-file asyncio lock to serialize the OAuth flow.
+        lock_key = str(self._token_file.resolve())
+        lock = _TOKEN_INIT_LOCKS.get(lock_key)
+        if lock is None:
+            lock = _TOKEN_INIT_LOCKS[lock_key] = asyncio.Lock()
+
+        async with lock:
+            # Double-check after acquiring the lock in case another task
+            # completed the flow while we were waiting.
+            self._token = _load_token_from_file()
+            if self._token:
+                return
+
+            # Start the local redirect server and run the OAuth flow.
             wsgi_app = _RedirectWSGIApp("Successfully obtained token.")
             wsgiref.simple_server.WSGIServer.allow_reuse_address = False
             host = "127.0.0.1"
@@ -129,42 +155,49 @@ class GoogleSession(dav.DAVSession):
             thread = Thread(target=local_server.handle_request)
             thread.start()
             self._redirect_uri = f"http://{host}:{local_server.server_port}"
-            async with self._session as session:
-                # Fail fast if the address is occupied
 
-                authorization_url, state = session.authorization_url(
-                    TOKEN_URL,
-                    # access_type and prompt are Google specific
-                    # extra parameters.
-                    access_type="offline",
-                    prompt="consent",
-                )
-                click.echo(f"Opening {authorization_url} ...")
-                try:
-                    open_graphical_browser(authorization_url)
-                except Exception as e:
-                    logger.warning(str(e))
+            try:
+                async with self._session as session:
+                    authorization_url, state = session.authorization_url(
+                        TOKEN_URL,
+                        # access_type and prompt are Google specific
+                        # extra parameters.
+                        access_type="offline",
+                        prompt="consent",
+                    )
+                    click.echo(f"Opening {authorization_url} ...")
+                    try:
+                        open_graphical_browser(authorization_url)
+                    except Exception as e:
+                        logger.warning(str(e))
 
-                click.echo("Follow the instructions on the page.")
-                thread.join()
-                logger.debug("server handled request!")
+                    click.echo("Follow the instructions on the page.")
+                    thread.join()
+                    logger.debug("server handled request!")
 
-                # Note: using https here because oauthlib is very picky that
-                # OAuth 2.0 should only occur over https.
-                authorization_response = wsgi_app.last_request_uri.replace(
-                    "http", "https", 1
-                )
-                logger.debug(f"authorization_response: {authorization_response}")
-                self._token = await session.fetch_token(
-                    REFRESH_URL,
-                    authorization_response=authorization_response,
-                    # Google specific extra param used for client authentication:
-                    client_secret=self._client_secret,
-                )
-                logger.debug(f"token: {self._token}")
+                    # Note: using https here because oauthlib is very picky that
+                    # OAuth 2.0 should only occur over https.
+                    authorization_response = wsgi_app.last_request_uri.replace(
+                        "http", "https", 1
+                    )
+                    logger.debug(
+                        f"authorization_response: {authorization_response}"
+                    )
+
+                    # Exchange authorization code for tokens
+                    self._token = await session.fetch_token(
+                        REFRESH_URL,
+                        authorization_response=authorization_response,
+                        # Google specific extra param used for client authentication:
+                        client_secret=self._client_secret,
+                    )
+                    logger.debug(f"token: {self._token}")
+            finally:
+                # Always close the local server to free the port.
                 local_server.server_close()
 
-            # FIXME: Ugly
+            # Persist token after successful fetch so that concurrent sessions
+            # can immediately reuse it.
             self._save_token(self._token)
 
 
